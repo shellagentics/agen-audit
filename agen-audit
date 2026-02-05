@@ -1,17 +1,40 @@
 #!/bin/bash
+# =============================================================================
+# agen-audit — Query and inspect agent execution traces
+# =============================================================================
 #
-# agen-audit - Query and inspect agent execution traces
+# PURPOSE:
+#   Queries the JSONL log files created by agen-log. This tool demonstrates
+#   the observability thesis: you can answer questions about what your AI
+#   agents did using standard Unix tools plus a thin convenience layer.
 #
-# Reads JSONL logs from agen-log. Demonstrates the observability thesis.
+# DESIGN PHILOSOPHY:
+#   - Convenience, not necessity: You could do this with grep + jq
+#   - Composable filters: Multiple criteria combine with AND logic
+#   - Exit codes matter: 0 = found results, 1 = no results (for scripting)
+#   - Two output modes: human-readable (pretty) or machine-readable (json)
 #
-# Usage:
-#   agen-audit --today
-#   agen-audit --agent data --event execution --today
-#   agen-audit --grep "prod" --today
+# EXAMPLES:
+#   agen-audit --today                           # What happened today?
+#   agen-audit --agent data --event execution    # What commands did data run?
+#   agen-audit --today --grep "error"            # Any errors today?
 #
+# WHY THIS EXISTS:
+#   The log files are simple enough that you never *need* this tool. But
+#   common questions like "what happened today?" are tedious to express with
+#   raw grep/jq. This tool makes the common case easy while preserving the
+#   ability to use raw tools for complex queries.
+#
+# =============================================================================
+
+# Exit immediately on error, undefined variable, or pipe failure.
 set -euo pipefail
 
 VERSION="0.1.0"
+
+# =============================================================================
+# HELP TEXT
+# =============================================================================
 
 show_help() {
   cat >&2 <<'EOF'
@@ -45,94 +68,232 @@ EXAMPLES
 EOF
 }
 
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
 die() { echo "agen-audit: $*" >&2; exit 1; }
 
-# Defaults
-AGENT=""
-EVENT=""
-GREP_PATTERN=""
-AFTER=""
-BEFORE=""
-FORMAT="pretty"
-LOG_DIR="${AGEN_LOG_DIR:-./logs}"
+# =============================================================================
+# DEFAULT VALUES
+# =============================================================================
 
-# Parse arguments
+AGENT=""           # Filter: only this agent's events
+EVENT=""           # Filter: only this event type
+GREP_PATTERN=""    # Filter: message content must match this regex
+AFTER=""           # Filter: events on or after this date
+BEFORE=""          # Filter: events before this date
+FORMAT="pretty"    # Output format: pretty or json
+LOG_DIR="${AGEN_LOG_DIR:-./logs}"  # Where to read logs from
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --help) show_help; exit 0 ;;
-    --version) echo "agen-audit $VERSION"; exit 0 ;;
-    --today) AFTER="$(date +%Y-%m-%d)"; shift ;;
-    --agent=*) AGENT="${1#*=}"; shift ;;
-    --agent) AGENT="$2"; shift 2 ;;
-    --event=*) EVENT="${1#*=}"; shift ;;
-    --event) EVENT="$2"; shift 2 ;;
-    --grep=*) GREP_PATTERN="${1#*=}"; shift ;;
-    --grep) GREP_PATTERN="$2"; shift 2 ;;
-    --after=*) AFTER="${1#*=}"; shift ;;
-    --after) AFTER="$2"; shift 2 ;;
-    --before=*) BEFORE="${1#*=}"; shift ;;
-    --before) BEFORE="$2"; shift 2 ;;
-    --format=*) FORMAT="${1#*=}"; shift ;;
-    --format) FORMAT="$2"; shift 2 ;;
-    --log-dir=*) LOG_DIR="${1#*=}"; shift ;;
-    --log-dir) LOG_DIR="$2"; shift 2 ;;
-    --*) die "Unknown option: $1" ;;
-    *) die "Unexpected argument: $1" ;;
+    --help)
+      show_help
+      exit 0
+      ;;
+    --version)
+      echo "agen-audit $VERSION"
+      exit 0
+      ;;
+
+    # --today is syntactic sugar for --after=<today's date>
+    # This is the most common query, so it gets a shortcut
+    --today)
+      AFTER="$(date +%Y-%m-%d)"
+      shift
+      ;;
+
+    --agent=*)
+      AGENT="${1#*=}"
+      shift
+      ;;
+    --agent)
+      AGENT="$2"
+      shift 2
+      ;;
+
+    --event=*)
+      EVENT="${1#*=}"
+      shift
+      ;;
+    --event)
+      EVENT="$2"
+      shift 2
+      ;;
+
+    --grep=*)
+      GREP_PATTERN="${1#*=}"
+      shift
+      ;;
+    --grep)
+      GREP_PATTERN="$2"
+      shift 2
+      ;;
+
+    --after=*)
+      AFTER="${1#*=}"
+      shift
+      ;;
+    --after)
+      AFTER="$2"
+      shift 2
+      ;;
+
+    --before=*)
+      BEFORE="${1#*=}"
+      shift
+      ;;
+    --before)
+      BEFORE="$2"
+      shift 2
+      ;;
+
+    --format=*)
+      FORMAT="${1#*=}"
+      shift
+      ;;
+    --format)
+      FORMAT="$2"
+      shift 2
+      ;;
+
+    --log-dir=*)
+      LOG_DIR="${1#*=}"
+      shift
+      ;;
+    --log-dir)
+      LOG_DIR="$2"
+      shift 2
+      ;;
+
+    --*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      die "Unexpected argument: $1"
+      ;;
   esac
 done
 
-# Determine which log file to read
+# =============================================================================
+# DETERMINE WHICH LOG FILE TO READ
+# =============================================================================
+# If filtering by agent, read only that agent's log file (more efficient).
+# Otherwise, read the combined log file that contains all agents.
+
 if [[ -n "$AGENT" ]]; then
   LOG_FILE="$LOG_DIR/$AGENT.jsonl"
 else
   LOG_FILE="$LOG_DIR/all.jsonl"
 fi
 
+# If the log file doesn't exist, there are no results
 [[ -f "$LOG_FILE" ]] || { echo "No logs found" >&2; exit 1; }
 
-# Build jq filter
+# =============================================================================
+# BUILD JQ FILTER
+# =============================================================================
+# We construct a jq filter expression by chaining select() calls.
+# Each filter adds another select() that narrows the results.
+#
+# Why jq? Because it handles JSON properly. Grepping for "error" might match
+# an agent named "error_handler". jq lets us query specific fields.
+#
+# The filter starts with "." (identity, matches everything) and we append
+# select() calls for each active filter.
+
 JQ_FILTER="."
 
+# Filter by agent name (exact match)
 if [[ -n "$AGENT" ]]; then
   JQ_FILTER="$JQ_FILTER | select(.agent == \"$AGENT\")"
 fi
 
+# Filter by event type (exact match)
 if [[ -n "$EVENT" ]]; then
   JQ_FILTER="$JQ_FILTER | select(.event == \"$EVENT\")"
 fi
 
+# Filter by date: events on or after this date
+# ISO 8601 timestamps sort lexicographically, so string comparison works!
+# "2024-01-15T06:00:00Z" >= "2024-01-15" is true as a string comparison.
 if [[ -n "$AFTER" ]]; then
   JQ_FILTER="$JQ_FILTER | select(.ts >= \"$AFTER\")"
 fi
 
+# Filter by date: events before this date
 if [[ -n "$BEFORE" ]]; then
   JQ_FILTER="$JQ_FILTER | select(.ts < \"$BEFORE\")"
 fi
 
+# Filter by message content (case-insensitive regex search)
+# The test() function in jq does regex matching.
+# The "i" flag makes it case-insensitive.
 if [[ -n "$GREP_PATTERN" ]]; then
   JQ_FILTER="$JQ_FILTER | select(.message | test(\"$GREP_PATTERN\"; \"i\"))"
 fi
 
-# Run query
+# =============================================================================
+# RUN THE QUERY
+# =============================================================================
+# Apply the jq filter to the log file.
+# -c outputs compact JSON (one object per line, for JSONL format).
+# We capture the output to check if there are any results.
+#
+# The || true prevents the script from exiting if jq finds nothing
+# (since we have set -e, an empty result would otherwise be an error).
+
 RESULTS=$(jq -c "$JQ_FILTER" "$LOG_FILE" 2>/dev/null || true)
 
+# If no results, exit with code 1
+# This enables conditional scripting: if agen-audit --today --grep "error"; then ...
 if [[ -z "$RESULTS" ]]; then
   exit 1
 fi
 
-# Output based on format
+# =============================================================================
+# FORMAT AND OUTPUT RESULTS
+# =============================================================================
+
 case "$FORMAT" in
+
+  # ---------------------------------------------------------------------------
+  # JSON format: pass through the raw JSONL
+  # ---------------------------------------------------------------------------
+  # Each line is a complete JSON object. Suitable for piping to other tools.
   json)
     echo "$RESULTS"
     ;;
+
+  # ---------------------------------------------------------------------------
+  # Pretty format: human-readable columns
+  # ---------------------------------------------------------------------------
+  # Format: [HH:MM:SS] agent    | event     | message
+  # Columns are padded for alignment. Time is extracted from ISO timestamp.
   pretty)
     echo "$RESULTS" | jq -r '
+      # Extract time portion: "2024-01-15T06:00:01Z" -> "06:00:01"
+      # .ts | split("T")[1] gets "06:00:01Z"
+      # split("Z")[0] removes the Z
+      # .[0:8] gets first 8 chars (HH:MM:SS)
       "[" + (.ts | split("T")[1] | split("Z")[0] | .[0:8]) + "] " +
+
+      # Agent name, padded to 8 characters for alignment
       (.agent | . + " " * (8 - length)) + "| " +
+
+      # Event type, padded to 10 characters for alignment
       (.event | . + " " * (10 - length)) + "| " +
+
+      # The message content
       .message
     '
     ;;
+
   *)
     die "Unknown format: $FORMAT (use: pretty, json)"
     ;;
